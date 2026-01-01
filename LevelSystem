@@ -1,0 +1,223 @@
+-- ReplicatedStorage/LevelSystem.lua
+-- Handles XP, Level, saving, and live updates (nametag auto-updates when Level changes).
+-- This version EXPECTS "Level" and "XP" IntValues to already exist
+-- under player.Stats (created by LeaderstatsExtra.server.lua).
+
+local Players          = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+
+local LevelSystem = {}
+
+-- ================= CONFIG =================
+LevelSystem.XP_PER_LEVEL       = 1000     -- 1000 XP = +1 level
+
+-- MAX_LEVEL:
+--   > 0  = cap at that level
+--   <= 0 = NO CAP (level can grow as high as XP allows, limited only by IntValue max)
+LevelSystem.MAX_LEVEL          = 0
+
+LevelSystem.PLAY_XP_INTERVAL   = 60       -- seconds between passive XP ticks
+LevelSystem.XP_PER_PLAY_TICK   = 10       -- XP every interval
+
+LevelSystem.XP_PER_CHECKPOINT  = 25       -- small XP
+LevelSystem.XP_PER_SUMMIT      = 300      -- big XP
+-- =========================================
+
+local LEVEL_DATA_VERSION = 1
+local LevelStore = DataStoreService:GetDataStore("LevelXP_v1")
+
+local lastSaveTimes = {}        -- [Player] = last save time (os.clock)
+local boundPlayers  = {}        -- [Player] = true when we've bound Level/XP + listeners
+
+local function dataKey(plr)
+	return ("LV_%d_v%d"):format(plr.UserId, LEVEL_DATA_VERSION)
+end
+
+-- Convert XP -> level
+local function getLevelForXP(xp)
+	xp = math.max(0, xp)
+	local lvl = math.floor(xp / LevelSystem.XP_PER_LEVEL) + 1
+
+	-- Only clamp if MAX_LEVEL > 0
+	if LevelSystem.MAX_LEVEL and LevelSystem.MAX_LEVEL > 0 then
+		if lvl > LevelSystem.MAX_LEVEL then
+			lvl = LevelSystem.MAX_LEVEL
+		end
+	end
+
+	return lvl
+end
+
+-- Attach datastore + xp.Changed -> level auto-update
+local function bindPlayer(plr)
+	-- Already bound this player?
+	if boundPlayers[plr] then
+		local ls = plr:FindFirstChild("Stats")
+		if not ls then return nil, nil end
+		return ls:FindFirstChild("Level"), ls:FindFirstChild("XP")
+	end
+
+	local ls = plr:WaitForChild("Stats", 10)
+	if not ls then
+		warn("[LevelSystem] Stats missing for " .. plr.Name)
+		return nil, nil
+	end
+
+	local level = ls:WaitForChild("Level", 10)
+	local xp    = ls:WaitForChild("XP", 10)
+	if not level or not xp then
+		warn("[LevelSystem] Level or XP missing under Stats for " .. plr.Name)
+		return nil, nil
+	end
+
+	boundPlayers[plr] = true
+
+	-- Load saved data (once per join)
+	local ok, data = pcall(function()
+		return LevelStore:GetAsync(dataKey(plr))
+	end)
+
+	if ok and data then
+		if typeof(data.xp) == "number" then
+			xp.Value = math.max(0, data.xp)
+		end
+		if typeof(data.level) == "number" then
+			local savedLevel = math.floor(data.level)
+
+			if LevelSystem.MAX_LEVEL and LevelSystem.MAX_LEVEL > 0 then
+				savedLevel = math.clamp(savedLevel, 1, LevelSystem.MAX_LEVEL)
+			else
+				if savedLevel < 1 then
+					savedLevel = 1
+				end
+			end
+
+			level.Value = savedLevel
+		else
+			level.Value = getLevelForXP(xp.Value)
+		end
+	else
+		-- No saved data; compute from XP
+		level.Value = getLevelForXP(xp.Value)
+	end
+
+	-- Live update Level whenever XP changes
+	xp.Changed:Connect(function()
+		local newXP    = math.max(0, xp.Value)
+		local newLevel = getLevelForXP(newXP)
+		if level.Value ~= newLevel then
+			level.Value = newLevel
+		end
+	end)
+
+	return level, xp
+end
+
+local function savePlayer(plr)
+	local now = os.clock()
+	if lastSaveTimes[plr] and now - lastSaveTimes[plr] < 15 then
+		return
+	end
+	lastSaveTimes[plr] = now
+
+	local ls = plr:FindFirstChild("Stats")
+	if not ls then return end
+	local level = ls:FindFirstChild("Level")
+	local xp    = ls:FindFirstChild("XP")
+	if not level or not xp then return end
+
+	local data = {
+		level = level.Value,
+		xp    = xp.Value,
+	}
+
+	pcall(function()
+		LevelStore:SetAsync(dataKey(plr), data)
+	end)
+end
+
+-- ============ PUBLIC API ============
+
+function LevelSystem.AddXP(plr, amount)
+	if not plr or not amount or amount == 0 then return end
+	local ls = plr:FindFirstChild("Stats")
+	if not ls then return end
+
+	local xp = ls:FindFirstChild("XP")
+	if not xp then return end
+
+	xp.Value = math.max(0, xp.Value + amount)
+	-- Level auto-updates because of xp.Changed listener
+end
+
+function LevelSystem.SetLevel(plr, newLevel)
+	if not plr or newLevel == nil then return end
+
+	-- Floor and clamp only if MAX_LEVEL is enabled
+	if LevelSystem.MAX_LEVEL and LevelSystem.MAX_LEVEL > 0 then
+		newLevel = math.clamp(math.floor(newLevel), 1, LevelSystem.MAX_LEVEL)
+	else
+		newLevel = math.floor(newLevel)
+		if newLevel < 1 then
+			newLevel = 1
+		end
+	end
+
+	local ls = plr:FindFirstChild("Stats")
+	if not ls then return end
+	local level = ls:FindFirstChild("Level")
+	local xp    = ls:FindFirstChild("XP")
+	if not level or not xp then return end
+
+	level.Value = newLevel
+	xp.Value    = (newLevel - 1) * LevelSystem.XP_PER_LEVEL
+
+	-- Save immediately when an admin force-sets the level
+	savePlayer(plr)
+end
+
+function LevelSystem.Init()
+	if LevelSystem._inited then return end
+	LevelSystem._inited = true
+
+	Players.PlayerAdded:Connect(function(plr)
+		bindPlayer(plr)
+
+		-- passive XP over playtime
+		task.spawn(function()
+			while plr.Parent do
+				task.wait(LevelSystem.PLAY_XP_INTERVAL)
+				if plr.Parent then
+					LevelSystem.AddXP(plr, LevelSystem.XP_PER_PLAY_TICK)
+				end
+			end
+		end)
+	end)
+
+	-- For Studio test when players already exist
+	for _, plr in ipairs(Players:GetPlayers()) do
+		bindPlayer(plr)
+		task.spawn(function()
+			while plr.Parent do
+				task.wait(LevelSystem.PLAY_XP_INTERVAL)
+				if plr.Parent then
+					LevelSystem.AddXP(plr, LevelSystem.XP_PER_PLAY_TICK)
+				end
+			end
+		end)
+	end
+
+	Players.PlayerRemoving:Connect(function(plr)
+		savePlayer(plr)
+		lastSaveTimes[plr] = nil
+		boundPlayers[plr]  = nil
+	end)
+
+	game:BindToClose(function()
+		for _, plr in ipairs(Players:GetPlayers()) do
+			savePlayer(plr)
+		end
+	end)
+end
+
+return LevelSystem

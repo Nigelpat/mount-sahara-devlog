@@ -1,0 +1,596 @@
+-- ShopUI_ExclusiveStore.client.lua
+-- Place inside: ShopUI.ShopFrame.ExclusiveStoreFrame
+
+local Players            = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+----------------------------------------------------------------------
+-- SMALL HELPERS
+----------------------------------------------------------------------
+
+local function findDesc(root: Instance, name: string): Instance?
+	if not root then return nil end
+	return root:FindFirstChild(name, true)
+end
+
+local function setGuiGroupVisible(container: Instance?, visible: boolean)
+	if not container then return end
+
+	if container:IsA("GuiObject") then
+		container.Visible = visible
+	elseif container:IsA("Folder") then
+		for _, child in ipairs(container:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child.Visible = visible
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- BASIC UI REFERENCES (SHOP)
+----------------------------------------------------------------------
+
+local shopGui    = script:FindFirstAncestorOfClass("ScreenGui") or playerGui:WaitForChild("ShopUI")
+local shopFrame  = shopGui:WaitForChild("ShopFrame")
+local storeRoot  = shopFrame:WaitForChild("ExclusiveStoreFrame")
+local allStoreFrame = storeRoot:WaitForChild("AllStoreFrame")
+
+local coinsFolder   = allStoreFrame:WaitForChild("CoinsFolder")
+local vipFolder     = allStoreFrame:WaitForChild("VipFolder")
+local itemsPage     = allStoreFrame:WaitForChild("ITEM")      -- ScrollingFrame
+local vipPage       = vipFolder:WaitForChild("VipFrame")      -- VIP panel
+
+-- Tab buttons
+local itemTabButton  = storeRoot:WaitForChild("ItemButtonFrame"):WaitForChild("ItemsButton")
+local vipTabButton   = storeRoot:WaitForChild("VipButtonFrame"):WaitForChild("VipButton")
+local coinsTabButton = storeRoot:WaitForChild("CoinsButtonFrame"):WaitForChild("CoinsButton")
+local closeButton    = storeRoot:WaitForChild("CloseButton")
+
+----------------------------------------------------------------------
+-- REMOTES & CONFIG
+----------------------------------------------------------------------
+
+local ShopGrantEvent      = ReplicatedStorage:WaitForChild("ShopGrantEvent")
+local AutoSummitEvent     = ReplicatedStorage:WaitForChild("AutoSummitEvent")
+local ShopGiftRequest     = ReplicatedStorage:WaitForChild("ShopGiftRequest")
+local CoinPurchaseRequest = ReplicatedStorage:WaitForChild("CoinPurchaseRequest")
+
+-- Gamepass IDs (items tab)
+local PASS_IDS = {
+	boombox   = 1484426905,
+	speedcoil = 1486156252, -- Apple Coil
+	slap      = 1564371795,
+	taser     = 1577682639,
+	sandball  = 1577331550,
+}
+
+-- Dev products (items tab, NOT coins)
+local PRODUCT_IDS = {
+	autosummit1x = 3446455848, -- Auto Summit
+}
+
+local VIP_DEV_PRODUCT_ID = 3474686185 -- VIP
+
+----------------------------------------------------------------------
+-- GIFT UI REFERENCES (GiftUI / GiftFrame)
+----------------------------------------------------------------------
+
+local openGiftUI -- forward declaration
+
+local giftGui    = playerGui:WaitForChild("GiftUI")
+local giftFrame  = giftGui:WaitForChild("GiftFrame")
+local giftScroll = giftFrame:WaitForChild("GiftScrollingFrame")
+local giftCloseBtn = giftFrame:WaitForChild("CloseButton")
+
+-- Search bar: in your UI it's "SeachBar"
+local giftSearchBar = findDesc(giftFrame, "SeachBar") or findDesc(giftFrame, "SearchBar")
+if giftSearchBar and not giftSearchBar:IsA("TextBox") then
+	giftSearchBar = nil
+end
+
+-- Template card = first Frame inside GiftScrollingFrame
+local giftTemplateCard: Frame? = nil
+for _, child in ipairs(giftScroll:GetChildren()) do
+	if child:IsA("Frame") then
+		giftTemplateCard = child
+		break
+	end
+end
+
+if giftTemplateCard then
+	giftTemplateCard.Visible = false -- keep as invisible template
+else
+	warn("[ShopUI] No template Frame found inside GiftScrollingFrame")
+end
+
+-- State of current gift
+local currentGiftKey: string? = nil   -- "coins_1000", "speedcoil", etc.
+local currentGiftMode: string = "item"  -- "item" or "coin"
+
+-- Keep GiftUI across respawns
+pcall(function()
+	giftGui.ResetOnSpawn = false
+end)
+giftGui.Enabled = false
+
+local function closeGiftUI()
+	giftGui.Enabled = false
+end
+
+if giftCloseBtn and giftCloseBtn:IsA("GuiButton") then
+	giftCloseBtn.MouseButton1Click:Connect(closeGiftUI)
+end
+
+----------------------------------------------------------------------
+-- OWNERSHIP HELPERS
+----------------------------------------------------------------------
+
+local function isPassKey(key: string)
+	return PASS_IDS[key] ~= nil
+end
+
+local function attrNameFor(key: string)
+	return "Owns_" .. key
+end
+
+local function owns(key: string): boolean
+	if not isPassKey(key) then
+		return false
+	end
+
+	if key == "boombox" then
+		return player:GetAttribute("OwnsBoomboxPass") == true
+			or player:GetAttribute(attrNameFor(key)) == true
+	end
+
+	return player:GetAttribute(attrNameFor(key)) == true
+end
+
+local function isAdminNow(): boolean
+	return player:GetAttribute("IsAdmin") == true
+end
+
+----------------------------------------------------------------------
+-- ITEM KEY DEDUCTION
+----------------------------------------------------------------------
+
+local FALLBACK_WORDS = {
+	boombox      = {"boombox","radio","song"},
+	speedcoil    = {"speed","coil","apple","light"},
+	autosummit1x = {"summit","auto","1x","teleport"},
+	slap         = {"slap","glove"},
+	taser        = {"taser","shock","zap"},
+	sandball     = {"sand","ball","grenade"},
+}
+
+local function deduceItemKey(itemFrame: Instance): string?
+	local a = itemFrame:GetAttribute("ItemKey")
+	if typeof(a) == "string" and a ~= "" then
+		return string.lower(a)
+	end
+
+	local lname = string.lower(itemFrame.Name)
+	for k, words in pairs(FALLBACK_WORDS) do
+		for _, w in ipairs(words) do
+			if string.find(lname, w) then
+				return k
+			end
+		end
+	end
+
+	local tl = itemFrame:FindFirstChildWhichIsA("TextLabel", true)
+	if tl then
+		local t = string.lower(tl.Text)
+		for k, words in pairs(FALLBACK_WORDS) do
+			for _, w in ipairs(words) do
+				if string.find(t, w) then
+					return k
+				end
+			end
+		end
+	end
+
+	warn("ShopUI: set Attribute ItemKey on item frame: ", itemFrame:GetFullName())
+	return nil
+end
+
+----------------------------------------------------------------------
+-- COIN KEY DEDUCTION  ("1000" -> "coins_1000")
+----------------------------------------------------------------------
+
+local function deduceCoinKey(coinFrame: Instance): string?
+	local a = coinFrame:GetAttribute("CoinKey")
+	if typeof(a) == "string" and a ~= "" then
+		return a
+	end
+
+	local n = coinFrame.Name
+	if n == "1000" or n == "5000" or n == "10000" then
+		return "coins_" .. n
+	end
+
+	local tl = coinFrame:FindFirstChildWhichIsA("TextLabel", true)
+	if tl then
+		local digits = tl.Text:match("%d+")
+		if digits then
+			return "coins_" .. digits
+		end
+	end
+
+	warn("ShopUI: can't deduce coin key for ", coinFrame:GetFullName())
+	return nil
+end
+
+----------------------------------------------------------------------
+-- BUY LOGIC (ITEMS TAB)
+----------------------------------------------------------------------
+
+local function handleBuyItem(key: string)
+	if not key then return end
+
+	-- AutoSummit dev product
+	if key == "autosummit1x" then
+		if isAdminNow() then
+			AutoSummitEvent:FireServer()
+		else
+			local pid = PRODUCT_IDS[key]
+			if pid then
+				MarketplaceService:PromptProductPurchase(player, pid)
+			else
+				warn("[ShopUI] No PRODUCT_IDS for " .. key)
+			end
+		end
+		return
+	end
+
+	-- Gamepasses
+	if isPassKey(key) then
+		if owns(key) then
+			-- already own: just tell server to grant/equip
+			ShopGrantEvent:FireServer(key)
+		else
+			local gid = PASS_IDS[key]
+			if gid then
+				MarketplaceService:PromptGamePassPurchase(player, gid)
+			else
+				warn("[ShopUI] No PASS_IDS for " .. key)
+			end
+		end
+		return
+	end
+
+	warn("[ShopUI] Unknown shop key: " .. tostring(key))
+end
+
+----------------------------------------------------------------------
+-- GIFT UI LOGIC (avatars + two usernames + search)
+----------------------------------------------------------------------
+
+local function setCardVisuals(card: Frame, plr: Player)
+	-- Avatar image (ImageLabel named "Player")
+	local avatar = findDesc(card, "Player")
+	if avatar and avatar:IsA("ImageLabel") then
+		local thumb, _ = Players:GetUserThumbnailAsync(
+			plr.UserId,
+			Enum.ThumbnailType.HeadShot,
+			Enum.ThumbnailSize.Size100x100
+		)
+		avatar.Image = thumb
+	end
+
+	-- Two username labels
+	local username1 = findDesc(card, "Username1")
+	local username2 = findDesc(card, "Username2")
+
+	-- Username1 = @DisplayName
+	-- Username2 = @Username
+	if username1 and username1:IsA("TextLabel") then
+		username1.Text = "@" .. plr.DisplayName
+	end
+	if username2 and username2:IsA("TextLabel") then
+		username2.Text = "@" .. plr.Name
+	end
+end
+
+local function populateGiftList()
+	if not giftTemplateCard then return end
+
+	-- Remove old cards (keep template & layout)
+	for _, child in ipairs(giftScroll:GetChildren()) do
+		if child:IsA("Frame") and child ~= giftTemplateCard then
+			child:Destroy()
+		end
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then
+			local card = giftTemplateCard:Clone()
+			card.Visible = true
+			card.Parent = giftScroll
+			card.Name = plr.Name
+
+			setCardVisuals(card, plr)
+
+			-- yellow GiftButton2
+			local giftButton2 = findDesc(card, "GiftButton2")
+			if giftButton2 and giftButton2:IsA("GuiButton") then
+				giftButton2.MouseButton1Click:Connect(function()
+					if not currentGiftKey then return end
+
+					if currentGiftMode == "coin" then
+						-- coins gifting (already works)
+						if CoinPurchaseRequest then
+							CoinPurchaseRequest:FireServer(currentGiftKey, plr.UserId)
+						end
+					else
+						-- item gifting (AppleCoil, Slap, Taser, SandBall, AutoSummit)
+						if ShopGiftRequest then
+							-- just tell the server: which item key & which target
+							ShopGiftRequest:FireServer(currentGiftKey, plr.UserId)
+						end
+					end
+
+					closeGiftUI()
+				end)
+			end
+		end
+	end
+end
+
+local function applyGiftSearchFilter()
+	if not giftSearchBar or not giftSearchBar:IsA("TextBox") then return end
+
+	local q = string.lower(giftSearchBar.Text or "")
+
+	-- Treat default "SEARCH" text as empty so it doesn't hide cards
+	if q == "search" then
+		q = ""
+	end
+
+	for _, card in ipairs(giftScroll:GetChildren()) do
+		if card:IsA("Frame") and card ~= giftTemplateCard then
+			if q == "" then
+				card.Visible = true
+			else
+				local blob = ""
+
+				local u1 = findDesc(card, "Username1")
+				local u2 = findDesc(card, "Username2")
+
+				if u1 and u1:IsA("TextLabel") then
+					blob ..= " " .. string.lower(u1.Text)
+				end
+				if u2 and u2:IsA("TextLabel") then
+					blob ..= " " .. string.lower(u2.Text)
+				end
+
+				card.Visible = (string.find(blob, q, 1, true) ~= nil)
+			end
+		end
+	end
+end
+
+if giftSearchBar and giftSearchBar:IsA("TextBox") then
+	giftSearchBar:GetPropertyChangedSignal("Text"):Connect(applyGiftSearchFilter)
+end
+
+openGiftUI = function(forKey: string, mode: string)
+	if not forKey then return end
+
+	currentGiftKey  = forKey
+	currentGiftMode = mode or "item"
+
+	-- Do NOT clear the word "SEARCH"; we leave the Text alone.
+	populateGiftList()
+	giftGui.Enabled = true
+end
+
+----------------------------------------------------------------------
+-- ITEM CARD WIRING (ITEMS TAB)
+----------------------------------------------------------------------
+
+local function updateBuyText(itemFrame: Frame, key: string)
+	local buyBtn = itemFrame:FindFirstChild("BuyButton", true)
+	if not (buyBtn and buyBtn:IsA("TextButton")) then return end
+
+	if isPassKey(key) and owns(key) then
+		buyBtn.Text = "GET"
+	else
+		buyBtn.Text = "BUY"
+	end
+end
+
+local function findGiftButtonInItemFrame(itemFrame: Frame): GuiButton?
+	-- Try exact name first
+	local giftBtn = itemFrame:FindFirstChild("GiftButton", true)
+	if giftBtn and giftBtn:IsA("GuiButton") then
+		return giftBtn
+	end
+
+	-- Fallback: any button whose name contains "gift"
+	for _, d in ipairs(itemFrame:GetDescendants()) do
+		if d:IsA("GuiButton") and string.find(string.lower(d.Name), "gift") then
+			return d
+		end
+	end
+
+	return nil
+end
+
+local function wireItemFrame(itemFrame: Frame)
+	if itemFrame:GetAttribute("ShopWired") then return end
+	itemFrame:SetAttribute("ShopWired", true)
+
+	local key = deduceItemKey(itemFrame)
+	if not key then return end
+
+	-- BUY button
+	local buyBtn = itemFrame:FindFirstChild("BuyButton", true)
+	if not (buyBtn and buyBtn:IsA("GuiButton")) then
+		buyBtn = itemFrame:FindFirstChildWhichIsA("TextButton", true)
+	end
+
+	if buyBtn then
+		buyBtn.MouseButton1Click:Connect(function()
+			handleBuyItem(key)
+			updateBuyText(itemFrame, key)
+		end)
+	else
+		warn("ShopUI: Buy button missing for ", itemFrame:GetFullName())
+	end
+
+	-- GIFT button -> open GiftUI with THIS key
+	local giftBtn = findGiftButtonInItemFrame(itemFrame)
+	if giftBtn then
+		giftBtn.MouseButton1Click:Connect(function()
+			openGiftUI(key, "item")
+		end)
+	end
+
+	-- initial text & auto-update when ownership changes
+	updateBuyText(itemFrame, key)
+
+	if isPassKey(key) then
+		local attrName = attrNameFor(key)
+		player:GetAttributeChangedSignal(attrName):Connect(function()
+			updateBuyText(itemFrame, key)
+		end)
+
+		if key == "boombox" then
+			player:GetAttributeChangedSignal("OwnsBoomboxPass"):Connect(function()
+				updateBuyText(itemFrame, key)
+			end)
+		end
+	end
+end
+
+-- wire all existing item cards
+for _, child in ipairs(itemsPage:GetChildren()) do
+	if child:IsA("Frame") then
+		wireItemFrame(child)
+	end
+end
+
+itemsPage.ChildAdded:Connect(function(child)
+	if child:IsA("Frame") then
+		wireItemFrame(child)
+	end
+end)
+
+----------------------------------------------------------------------
+-- COIN CARD WIRING (COINS TAB)
+----------------------------------------------------------------------
+
+local function wireCoinFrame(coinFrame: Frame)
+	if coinFrame:GetAttribute("CoinWired") then return end
+	coinFrame:SetAttribute("CoinWired", true)
+
+	local key = deduceCoinKey(coinFrame)
+	if not key then return end
+
+	local buyBtn = coinFrame:FindFirstChild("BuyButton", true)
+	if not (buyBtn and buyBtn:IsA("GuiButton")) then
+		buyBtn = coinFrame:FindFirstChildWhichIsA("TextButton", true)
+	end
+
+	-- Buy coins for yourself
+	if buyBtn then
+		buyBtn.MouseButton1Click:Connect(function()
+			if CoinPurchaseRequest then
+				CoinPurchaseRequest:FireServer(key, nil) -- nil target = self
+			end
+		end)
+	else
+		warn("[ShopUI] BuyButton missing under coin frame " .. coinFrame:GetFullName())
+	end
+
+	-- Gift coins -> open GiftUI with coin key
+	local giftBtn = coinFrame:FindFirstChild("GiftButton", true)
+	if giftBtn and giftBtn:IsA("GuiButton") then
+		giftBtn.MouseButton1Click:Connect(function()
+			openGiftUI(key, "coin")
+		end)
+	end
+end
+
+for _, child in ipairs(coinsFolder:GetChildren()) do
+	if child:IsA("Frame") then
+		wireCoinFrame(child)
+	end
+end
+
+coinsFolder.ChildAdded:Connect(function(child)
+	if child:IsA("Frame") then
+		wireCoinFrame(child)
+	end
+end)
+
+----------------------------------------------------------------------
+-- VIP BUY BUTTON (VIP tab)
+----------------------------------------------------------------------
+
+local vipBuyButton = vipPage:FindFirstChild("BuyButton", true)
+
+if vipBuyButton and vipBuyButton:IsA("GuiButton") then
+	vipBuyButton.MouseButton1Click:Connect(function()
+		if VIP_DEV_PRODUCT_ID == 0 then
+			warn("[ShopUI] VIP_DEV_PRODUCT_ID is 0 – set your VIP dev product id.")
+			return
+		end
+
+		-- 1-month VIP dev product purchase
+		MarketplaceService:PromptProductPurchase(player, VIP_DEV_PRODUCT_ID)
+	end)
+else
+	warn("[ShopUI] Could not find VipFrame.BuyButton")
+end
+
+----------------------------------------------------------------------
+-- TAB SWITCHING (ITEM / VIP / COINS)
+----------------------------------------------------------------------
+
+local function setCategory(name: string)
+	if name == "item" then
+		setGuiGroupVisible(itemsPage, true)
+		setGuiGroupVisible(vipPage, false)
+		setGuiGroupVisible(coinsFolder, false)
+	elseif name == "vip" then
+		setGuiGroupVisible(itemsPage, false)
+		setGuiGroupVisible(vipPage, true)
+		setGuiGroupVisible(coinsFolder, false)
+	elseif name == "coins" then
+		setGuiGroupVisible(itemsPage, false)
+		setGuiGroupVisible(vipPage, false)
+		setGuiGroupVisible(coinsFolder, true)
+	end
+end
+
+itemTabButton.MouseButton1Click:Connect(function()
+	setCategory("item")
+end)
+
+vipTabButton.MouseButton1Click:Connect(function()
+	setCategory("vip")
+end)
+
+coinsTabButton.MouseButton1Click:Connect(function()
+	setCategory("coins")
+end)
+
+-- Default when shop opens
+setCategory("item")
+
+----------------------------------------------------------------------
+-- CLOSE BUTTON
+----------------------------------------------------------------------
+
+if closeButton and closeButton:IsA("GuiButton") then
+	closeButton.MouseButton1Click:Connect(function()
+		shopGui.Enabled = false
+	end)
+end

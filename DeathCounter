@@ -1,0 +1,90 @@
+-- ServerScriptService/Deaths.server.lua
+-- Lifetime Deaths counter with DataStore persistence
+-- This version DOES NOT create leaderstats or Deaths; those come from
+-- ServerScriptService/LeaderstatsExtra.server.lua
+
+local Players = game:GetService("Players")
+local DSS     = game:GetService("DataStoreService")
+local STORE   = DSS:GetDataStore("Deaths_v1")
+
+local function dsKey(userId)
+	return "Deaths_" .. userId
+end
+
+-- Get existing Deaths IntValue made by LeaderstatsExtra
+local function getDeathsValue(plr)
+	-- Wait for leaderstats to be created by LeaderstatsExtra
+	local ls = plr:WaitForChild("leaderstats", 10)
+	if not ls then
+		warn("[Deaths] leaderstats missing for " .. plr.Name)
+		return nil
+	end
+
+	-- Wait for Deaths IntValue (also created by LeaderstatsExtra)
+	local d = ls:WaitForChild("Deaths", 10)
+	if not d then
+		warn("[Deaths] Deaths stat missing for " .. plr.Name)
+		return nil
+	end
+
+	return d
+end
+
+local function load(plr)
+	local d = getDeathsValue(plr)
+	if not d then return end
+
+	local ok, val = pcall(function()
+		return STORE:GetAsync(dsKey(plr.UserId))
+	end)
+
+	if ok and typeof(val) == "number" then
+		d.Value = val
+	end
+end
+
+local function save(plr)
+	local ls = plr:FindFirstChild("leaderstats")
+	if not ls then return end
+
+	local d = ls:FindFirstChild("Deaths")
+	if not d then return end
+
+	local v = tonumber(d.Value) or 0
+	pcall(function()
+		STORE:SetAsync(dsKey(plr.UserId), v)
+	end)
+end
+
+Players.PlayerAdded:Connect(function(plr)
+	-- Load saved deaths into existing Deaths stat
+	load(plr)
+
+	local function hook(char)
+		local hum = char:FindFirstChildOfClass("Humanoid")
+			or char:WaitForChild("Humanoid", 10)
+		if not hum then return end
+
+		hum.Died:Connect(function()
+			local d = getDeathsValue(plr)
+			if not d then return end
+
+			d.Value += 1
+			save(plr)
+		end)
+	end
+
+	if plr.Character then
+		hook(plr.Character)
+	end
+
+	plr.CharacterAdded:Connect(hook)
+end)
+
+Players.PlayerRemoving:Connect(save)
+
+game:BindToClose(function()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		save(plr)
+	end
+end)

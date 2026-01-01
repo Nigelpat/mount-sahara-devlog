@@ -1,0 +1,716 @@
+-- Checkpoints + Summit + Quest + Saves
+-- CHANGES:
+--  - Summit increases by SUMMIT_INCREMENT per summit touch (default 1)
+--  - Coins per summit touch = COINS_PER_SUMMIT_UNIT * SUMMIT_INCREMENT * (COIN_GROWTH_FACTOR ^ touchesBefore)
+--    (so rewards grow by 1.001x every touch)
+--  - Quest reward (+200 coins on claim) unchanged
+--  - XP/Level added via LevelSystem:
+--      * XP on checkpoints
+--      * XP on summits
+--      * Level updates live (nametag shows [Lv.X] immediately)
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DSS               = game:GetService("DataStoreService")
+
+-- === LEVEL SYSTEM HOOK ===
+-- Requires ReplicatedStorage/LevelSystem ModuleScript
+local LevelSystem = require(ReplicatedStorage:WaitForChild("LevelSystem"))
+LevelSystem.Init()
+
+----------------------------------------------------------------------
+-- ======================= CONFIG / CONSTANTS =======================
+----------------------------------------------------------------------
+
+local COINS_PER_CP               = 0
+local QUEST_REWARD_COINS         = 200
+local SUMMIT_PART_NAME           = "SummitPads"
+-- local REQUIRED_LAST_CP_FOR_SUMMIT = 29
+
+-- Respawn preference
+local CLEAR_CHECKPOINTS_AFTER_SUMMIT = true
+local PREFER_CHECKPOINT_OVER_SUMMIT  = false
+
+-- Summit/coin logic
+local SUMMIT_INCREMENT             = 1      -- summit units added per summit touch
+local COINS_PER_SUMMIT_UNIT        = 100    -- base coins per summit unit
+
+-- NEW: multiplicative coin growth (1.0673002614x per summit touch)
+local COIN_GROWTH_FACTOR           = 1.0873002614
+
+-- (legacy / unused now) Summit reward curve kept for reference
+local SUMMIT_REWARD_BASE  = 100
+local SUMMIT_REWARD_RATIO = 1
+local function summitRewardFor(n)
+	return math.floor(SUMMIT_REWARD_BASE * (SUMMIT_REWARD_RATIO^(n-1)) + 0.5)
+end
+
+-- (legacy event system; not used for summit/coins anymore)
+local SUMMIT_EVENT_COIN_MODE = "flatx"
+
+local lastSummitTimes = {}
+local MIN_SUMMIT_COOLDOWN = 600 -- seconds between summits
+
+----------------------------------------------------------------------
+-- ========================== LIVE EVENT ============================
+----------------------------------------------------------------------
+
+local EventSignals = ReplicatedStorage:FindFirstChild("EventSignals") or Instance.new("Folder")
+EventSignals.Name = "EventSignals"; EventSignals.Parent = ReplicatedStorage
+
+local SummitEventMultValue = EventSignals:FindFirstChild("SummitEventMult") or Instance.new("NumberValue")
+SummitEventMultValue.Name = "SummitEventMult"; SummitEventMultValue.Parent = EventSignals
+SummitEventMultValue.Value = 1 -- no effect; we use linear units + multiplicative growth
+
+local function getEventMult()
+	local v = SummitEventMultValue and SummitEventMultValue.Value
+	return (typeof(v) == "number" and v >= 1) and v or 1
+end
+
+----------------------------------------------------------------------
+-- ============================ DATA ================================
+----------------------------------------------------------------------
+
+local CP_STORE    = DSS:GetDataStore("CPProgress_v1")
+local QUEST_STORE = DSS:GetDataStore("QuestDataStore")
+local COIN_STORE  = DSS:GetDataStore("Coins_v1")
+
+local CP_SAVE_COOLDOWN = 20
+local lastSaveTimestamps = {}
+
+local QUEST_STATES = {
+	AVAILABLE = "available",
+	CLAIMABLE = "claimable",
+	CLAIMED   = "claimed",
+}
+
+local function normalizeQuestState(v)
+	if v == true or v == "Completed" then return QUEST_STATES.CLAIMED end
+	if v == QUEST_STATES.CLAIMABLE or v == QUEST_STATES.CLAIMED then return v end
+	return QUEST_STATES.AVAILABLE
+end
+
+----------------------------------------------------------------------
+-- =========================== REMOTES =============================
+----------------------------------------------------------------------
+
+local SummitRewardEvent = ReplicatedStorage:FindFirstChild("SummitRewardEvent")
+if not SummitRewardEvent then
+	SummitRewardEvent = Instance.new("RemoteEvent")
+	SummitRewardEvent.Name = "SummitRewardEvent"
+	SummitRewardEvent.Parent = ReplicatedStorage
+end
+
+local QuestEvent = ReplicatedStorage:FindFirstChild("QuestEvent")
+if not QuestEvent then
+	QuestEvent = Instance.new("RemoteEvent")
+	QuestEvent.Name = "QuestEvent"
+	QuestEvent.Parent = ReplicatedStorage
+end
+
+local CheckpointFXEvent = ReplicatedStorage:FindFirstChild("CheckpointFXEvent")
+if not CheckpointFXEvent then
+	CheckpointFXEvent = Instance.new("RemoteEvent")
+	CheckpointFXEvent.Name = "CheckpointFXEvent"
+	CheckpointFXEvent.Parent = ReplicatedStorage
+end
+
+----------------------------------------------------------------------
+-- =========================== HELPERS =============================
+----------------------------------------------------------------------
+
+local function addStat(plr, name, delta)
+	local ls = plr:FindFirstChild("leaderstats")
+	if not ls then return end
+
+	local v = ls:FindFirstChild(name)
+	if not v then return end
+
+	v.Value += (delta or 1)
+end
+
+local function getProgress(plr)
+	local prog = plr:FindFirstChild("Progress")
+	if not prog then
+		prog = Instance.new("Folder")
+		prog.Name = "Progress"
+		prog.Parent = plr
+	end
+
+	local visited = prog:FindFirstChild("VisitedCP")
+	if not visited then
+		visited = Instance.new("Folder")
+		visited.Name = "VisitedCP"
+		visited.Parent = prog
+	end
+
+	local summitCount = prog:FindFirstChild("SummitCount")
+	if not summitCount then
+		summitCount = Instance.new("IntValue")
+		summitCount.Name = "SummitCount"
+		summitCount.Value = 0
+		summitCount.Parent = prog
+	end
+
+	local questState = prog:FindFirstChild("Quest1State")
+	if not questState then
+		questState = Instance.new("StringValue")
+		questState.Name = "Quest1State"
+		questState.Value = QUEST_STATES.AVAILABLE
+		questState.Parent = prog
+	end
+
+	local claimed = prog:FindFirstChild("SummitClaimed")
+	if not claimed then
+		claimed = Instance.new("BoolValue")
+		claimed.Name = "SummitClaimed"
+		claimed.Value = false
+		claimed.Parent = prog
+	end
+
+	return prog, visited, summitCount, questState, claimed
+end
+
+local function alreadyVisited(folder, n)
+	return folder:FindFirstChild("CP_"..n) ~= nil
+end
+
+local function markVisited(folder, n)
+	if not alreadyVisited(folder, n) then
+		local b = Instance.new("BoolValue")
+		b.Name = "CP_"..n
+		b.Value = true
+		b.Parent = folder
+	end
+end
+
+local function serializeVisited(folder)
+	local list = {}
+	for _,b in ipairs(folder:GetChildren()) do
+		local n = tonumber(b.Name:match("^CP_(%d+)$"))
+		if n then table.insert(list, n) end
+	end
+	table.sort(list)
+	return list
+end
+
+local function hydrateVisited(folder, list)
+	for _,n in ipairs(list or {}) do
+		markVisited(folder, n)
+	end
+end
+
+----------------------------------------------------------------------
+-- ======================== SAVE / LOAD ============================
+----------------------------------------------------------------------
+
+local function coinKey(plr)  return "Coins_"..plr.UserId end
+local function cpKey(plr)    return "CP_"..plr.UserId end
+local function questKey(plr) return "Quest1_"..plr.UserId end
+
+local function loadCoins(plr)
+	-- Wait for leaderstats & Coins made by LeaderstatsExtra
+	local ls = plr:WaitForChild("leaderstats", 10)
+	if not ls then return end
+
+	local coins = ls:FindFirstChild("Coins") or ls:WaitForChild("Coins", 5)
+	if not coins then
+		warn("[CP/Summit] Missing Coins stat for " .. plr.Name)
+		return
+	end
+
+	local ok, data = pcall(function()
+		return COIN_STORE:GetAsync(coinKey(plr))
+	end)
+
+	if ok and typeof(data) == "number" then
+		coins.Value = data
+	end
+end
+
+local function saveCoins(plr)
+	local ls = plr:FindFirstChild("leaderstats")
+	if not ls then return end
+	local coins = ls:FindFirstChild("Coins")
+	if not coins then return end
+
+	local value = tonumber(coins.Value) or 0
+	pcall(function()
+		COIN_STORE:SetAsync(coinKey(plr), value)
+	end)
+end
+
+local function saveCP(plr, kind)
+	local userId = plr.UserId
+	local now    = os.clock()
+	if (kind or "save") == "touch" then
+		local last = lastSaveTimestamps[userId]
+		if last and (now - last) < CP_SAVE_COOLDOWN then return end
+	end
+	print("[CP SUMMIT] Kind effective:", kind or "save")
+
+	lastSaveTimestamps[userId] = now
+
+	-- Bad asset clearing (unrelated to checkpoints, but kept)
+	local BAD_IDS = {
+		"4786404134",
+		"4749429581",
+		"4157293294",
+		"786116099",
+		"14647586029",
+		"6774386315",
+		"8210395700",
+	}
+
+	local function isBad(idStr)
+		if typeof(idStr) ~= "string" then return false end
+		for _, bad in ipairs(BAD_IDS) do
+			if idStr:find(bad, 1, true) then
+				return true
+			end
+		end
+		return false
+	end
+
+	local clearedCount = 0
+
+	for _, inst in ipairs(game:GetDescendants()) do
+		if inst:IsA("Sound") and isBad(inst.SoundId) then
+			print("Clearing SoundId on:", inst:GetFullName(), inst.SoundId)
+			inst.SoundId = ""
+			clearedCount += 1
+		end
+
+		if inst:IsA("Animation") and isBad(inst.AnimationId) then
+			print("Clearing AnimationId on:", inst:GetFullName(), inst.AnimationId)
+			inst.AnimationId = ""
+			clearedCount += 1
+		end
+	end
+
+	print("Done. Cleared", clearedCount, "assets.")
+
+	local _, visited, summitCount = getProgress(plr)
+
+	local lastToSave; local visitedToSave
+	if plr:FindFirstChild("Progress") and plr.Progress:FindFirstChild("SummitClaimed")
+		and plr.Progress.SummitClaimed.Value
+		and CLEAR_CHECKPOINTS_AFTER_SUMMIT then
+		lastToSave = nil
+		visitedToSave = {}
+	else
+		lastToSave = plr:GetAttribute("CP_Last")
+		visitedToSave = serializeVisited(visited)
+	end
+
+	local data = { last = lastToSave, visited = visitedToSave, summit = summitCount.Value }
+	for i=1,3 do
+		local ok, err = pcall(function() CP_STORE:SetAsync(cpKey(plr), data) end)
+		if ok then return true end
+		warn(("saveCP try %d failed for %s: %s"):format(i, plr.Name, tostring(err)))
+		task.wait(0.25 * i)
+	end
+	return false
+end
+
+local function loadCP(plr)
+	local _, visited, summitCount = getProgress(plr)
+	local ok, data = pcall(function() return CP_STORE:GetAsync(cpKey(plr)) end)
+	if ok and data then
+		hydrateVisited(visited, data.visited or {})
+		local last = tonumber(data.last)
+		plr:SetAttribute("CP_Last", last)
+		summitCount.Value = tonumber(data.summit) or 0
+
+		local ls = plr:FindFirstChild("leaderstats")
+		if ls then
+			local cpLS = ls:FindFirstChild("Checkpoint")
+			if cpLS then cpLS.Value = last or 0 end
+
+			local smLS = ls:FindFirstChild("Summit")
+			if smLS then smLS.Value = summitCount.Value end
+		end
+	else
+		plr:SetAttribute("CP_Last", nil)
+	end
+end
+
+local function loadQuest(plr)
+	local _,_,_,questState = getProgress(plr)
+	local ok, data = pcall(function() return QUEST_STORE:GetAsync(questKey(plr)) end)
+	local state = normalizeQuestState(ok and data or nil)
+	questState.Value = state
+	QuestEvent:FireClient(plr, "State", state)
+end
+
+local function saveQuest(plr)
+	local _,_,_,questState = getProgress(plr)
+	local state = normalizeQuestState(questState.Value)
+	pcall(function()
+		QUEST_STORE:SetAsync(questKey(plr), state)
+	end)
+end
+
+----------------------------------------------------------------------
+-- =================== CHECKPOINT / SUMMIT DETECT ===================
+----------------------------------------------------------------------
+
+local function extractCPNumber(name)
+	if not name then return nil end
+	local patterns = {
+		"^[Cc]heck[Pp]oint%s*(%d+)$",
+		"^[Cc][Pp]%s*(%d+)$",
+		"^CP[_%s-]*(%d+)$",
+	}
+	for _,pat in ipairs(patterns) do
+		local n = tonumber(name:match(pat))
+		if n then return n end
+	end
+end
+
+local function isSummitBasePart(part)
+	if not part:IsA("BasePart") then return false end
+	if part.Name == SUMMIT_PART_NAME then return true end
+	local p = part.Parent
+	for _=1,8 do
+		if not p then break end
+		if p.Name == SUMMIT_PART_NAME then return true end
+		p = p.Parent
+	end
+	return false
+end
+
+local function getCharacterFromTouched(part)
+	local model = part:FindFirstAncestorOfClass("Model")
+	if not model then return nil end
+	if model:FindFirstChildOfClass("Humanoid") then return model end
+	local ancestor = model.Parent
+	for _=1,5 do
+		if not ancestor then break end
+		if ancestor:IsA("Model") and ancestor:FindFirstChildOfClass("Humanoid") then
+			return ancestor
+		end
+		ancestor = ancestor.Parent
+	end
+	return nil
+end
+
+local CPIndex = {}
+local function findCheckpointByNumber(n)
+	local p = CPIndex[n]
+	if p and p.Parent then return p end
+	for _, obj in ipairs(workspace:WaitForChild("CheckpointMountain"):GetDescendants()) do
+		if obj:IsA("BasePart") and extractCPNumber(obj.Name) == n then
+			return obj
+		end
+	end
+	return nil
+end
+
+----------------------------------------------------------------------
+-- =========================== TOUCH FLOW ==========================
+----------------------------------------------------------------------
+
+local function onCheckpointTouch(cpPart, otherPart)
+	local char = getCharacterFromTouched(otherPart)
+	if not char then return end
+	local plr = Players:GetPlayerFromCharacter(char)
+	if not plr then return end
+
+	local num = extractCPNumber(cpPart.Name)
+	if not num then return end
+
+	if plr:GetAttribute("ForceDefaultSpawn") == true then
+		plr:SetAttribute("ForceDefaultSpawn", nil)
+	end
+
+	CheckpointFXEvent:FireClient(plr, "checkpoint", cpPart, num)
+
+	local ls = plr:FindFirstChild("leaderstats")
+	if ls then
+		local cpLS = ls:FindFirstChild("Checkpoint")
+		if cpLS and cpLS.Value < num then
+			cpLS.Value = num
+		end
+	end
+
+	local _, visited = getProgress(plr)
+	if not alreadyVisited(visited, num) then
+		markVisited(visited, num)
+
+		if COINS_PER_CP ~= 0 then
+			addStat(plr, "Coins", COINS_PER_CP)
+			saveCoins(plr)
+		end
+
+		-- XP for NEW checkpoint
+		LevelSystem.AddXP(plr, LevelSystem.XP_PER_CHECKPOINT or 0)
+	end
+
+	plr:SetAttribute("CP_Last", num)
+	saveCP(plr, "touch")
+end
+
+-- legacy (unused in new logic)
+local function coinsForSummitBundle(current, add)
+	if add <= 1 then
+		return summitRewardFor(current + 1)
+	end
+	if SUMMIT_EVENT_COIN_MODE == "flatx" then
+		return summitRewardFor(current + 1) * add
+	else
+		local total = 0
+		for i = 1, add do
+			total += summitRewardFor(current + i)
+		end
+		return total
+	end
+end
+
+local function applySummit(plr, summitPart)
+	local now = os.clock()
+	local userId = plr.UserId
+
+	local isBypassing = plr:GetAttribute("PurchasedAutoSummit") == true
+
+	if isBypassing then
+		plr:SetAttribute("PurchasedAutoSummit", nil)
+		print("✅ " .. plr.Name .. " used AutoSummit Product - Security Bypassed")
+	else
+		local lastTime = lastSummitTimes[userId]
+		if lastTime and (now - lastTime < MIN_SUMMIT_COOLDOWN) then
+			warn(plr.Name .. " tried to summit too fast! (Cooldown active) " .. now - lastTime .. "s")
+			return
+		end
+	end
+
+	lastSummitTimes[userId] = now
+
+	local ls = plr:FindFirstChild("leaderstats")
+	if not ls then return end
+
+	local summitStat = ls:FindFirstChild("Summit")
+	if not summitStat then return end
+
+	local _, _, summitCount, questState, claimed = getProgress(plr)
+	if claimed.Value then return end
+	claimed.Value = true
+
+	-- multiplicative growth
+	local before         = summitStat.Value
+	local addSummit      = SUMMIT_INCREMENT
+	local unitsPerTouch  = math.max(SUMMIT_INCREMENT, 1)
+	local basePerTouch   = COINS_PER_SUMMIT_UNIT * unitsPerTouch
+	local touchesBefore  = math.floor(before / unitsPerTouch)
+	local coinsToGive    = math.floor(basePerTouch * (COIN_GROWTH_FACTOR ^ touchesBefore) + 0.5)
+
+	summitStat.Value   = before + addSummit
+	summitCount.Value  = summitStat.Value
+	addStat(plr, "Coins", coinsToGive)
+	saveCoins(plr)
+
+	-- XP for summit
+	LevelSystem.AddXP(plr, LevelSystem.XP_PER_SUMMIT or 0)
+
+	-- make quest claimable
+	if questState.Value ~= QUEST_STATES.CLAIMED then
+		if questState.Value ~= QUEST_STATES.CLAIMABLE then
+			questState.Value = QUEST_STATES.CLAIMABLE
+			saveQuest(plr)
+			QuestEvent:FireClient(plr, "State", QUEST_STATES.CLAIMABLE)
+		end
+	end
+
+	-- save & FX
+	saveCP(plr)
+	pcall(function()
+		SummitRewardEvent:FireClient(plr, coinsToGive)
+	end)
+
+	if summitPart then
+		CheckpointFXEvent:FireClient(plr, "summit", summitPart)
+		if summitPart.CFrame then
+			plr:SetAttribute("SummitSpawnCF", summitPart.CFrame)
+			plr:SetAttribute("SummitSpawn",   summitPart.Position)
+		end
+	end
+end
+
+local function onSummitTouch(summitPart, otherPart)
+	local char = getCharacterFromTouched(otherPart)
+	if not char then return end
+	local plr = Players:GetPlayerFromCharacter(char)
+	if not plr then return end
+
+	-- if you ever re-enable "must be last CP", check here
+
+	applySummit(plr, summitPart)
+end
+
+local function bindCheckpointPad(cpPart)
+	if cpPart:GetAttribute("CPBound") then return end
+	cpPart:SetAttribute("CPBound", true)
+	cpPart.CanTouch = true
+	cpPart.Touched:Connect(function(other)
+		onCheckpointTouch(cpPart, other)
+	end)
+
+	local n = extractCPNumber(cpPart.Name)
+	if n then CPIndex[n] = cpPart end
+
+	local sec = cpPart:FindFirstChild("Checkpoint sec") or (cpPart.Parent and cpPart.Parent:FindFirstChild("Checkpoint sec"))
+	if sec and sec:IsA("BasePart") then
+		sec.CanTouch = true
+		sec.Touched:Connect(function(other)
+			onCheckpointTouch(cpPart, other)
+		end)
+	end
+end
+
+local function bindAllCheckpointsAndSummits()
+	local cpCount, smCount = 0, 0
+	for _, obj in ipairs(workspace:WaitForChild("CheckpointMountain"):GetDescendants()) do
+		if obj:IsA("BasePart") then
+			local n = extractCPNumber(obj.Name)
+			if n then
+				if not obj:GetAttribute("CPBound") then
+					bindCheckpointPad(obj)
+					cpCount += 1
+				end
+				CPIndex[n] = obj
+			elseif isSummitBasePart(obj) then
+				if not obj:GetAttribute("SummitBound") then
+					obj:SetAttribute("SummitBound", true)
+					obj.CanTouch = true
+					obj.Touched:Connect(function(other)
+						onSummitTouch(obj, other)
+					end)
+					smCount += 1
+				end
+			end
+		end
+	end
+	print(("[Checkpoint] bound %d; [Summit] bound %d"):format(cpCount, smCount))
+end
+
+bindAllCheckpointsAndSummits()
+
+----------------------------------------------------------------------
+-- ===================== QUEST CLAIM HANDLER =======================
+----------------------------------------------------------------------
+
+QuestEvent.OnServerEvent:Connect(function(plr, action)
+	if action == "ClaimQuest1" then
+		local _,_,_,questState = getProgress(plr)
+		if questState.Value == QUEST_STATES.CLAIMABLE then
+			questState.Value = QUEST_STATES.CLAIMED
+			addStat(plr, "Coins", QUEST_REWARD_COINS)
+			saveCoins(plr)
+			saveQuest(plr)
+			pcall(function()
+				SummitRewardEvent:FireClient(plr, QUEST_REWARD_COINS)
+			end)
+			QuestEvent:FireClient(plr, "State", QUEST_STATES.CLAIMED)
+		else
+			QuestEvent:FireClient(plr, "State", normalizeQuestState(questState.Value))
+		end
+	end
+end)
+
+----------------------------------------------------------------------
+-- ======================= TELEPORT / RESPAWN ======================
+----------------------------------------------------------------------
+
+local function teleportPlayerToSavedSpot(plr, char)
+	local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 10)
+	if not hrp then return false end
+
+	local last      = tonumber(plr:GetAttribute("CP_Last"))
+	local summitCF  = plr:GetAttribute("SummitSpawnCF")
+	local summitPos = plr:GetAttribute("SummitSpawn")
+	plr:SetAttribute("IsTeleporting", true)
+
+	task.delay(2, function()
+		if plr then
+			plr:SetAttribute("IsTeleporting", nil)
+			plr:SetAttribute("ForceDefaultSpawn", nil)
+		end
+	end)
+
+	local function set(cf)
+		if not hrp.Parent then return false end
+		hrp.CFrame = cf
+		return true
+	end
+
+	if not PREFER_CHECKPOINT_OVER_SUMMIT then
+		if typeof(summitCF) == "CFrame" and set(summitCF + Vector3.new(0,5,0)) then return true end
+		if typeof(summitPos) == "Vector3" and set(CFrame.new(summitPos + Vector3.new(0,5,0))) then return true end
+		if last and last > 0 then
+			local pad = findCheckpointByNumber(last)
+			if pad and set(pad.CFrame + Vector3.new(0,4,0)) then return true end
+		end
+	else
+		if last and last > 0 then
+			local pad = findCheckpointByNumber(last)
+			if pad and set(pad.CFrame + Vector3.new(0,4,0)) then return true end
+		end
+		if typeof(summitCF) == "CFrame" and set(summitCF + Vector3.new(0,5,0)) then return true end
+		if typeof(summitPos) == "Vector3" and set(CFrame.new(summitPos + Vector3.new(0,5,0))) then return true end
+	end
+
+	return false
+end
+
+----------------------------------------------------------------------
+-- ========================= PLAYER LIFECYCLE ======================
+----------------------------------------------------------------------
+
+Players.PlayerAdded:Connect(function(plr)
+	-- Do NOT create leaderstats here anymore; just wait for the ones
+	-- created by ServerScriptService/LeaderstatsExtra.server.lua
+	local ls = plr:WaitForChild("leaderstats", 10)
+	if not ls then
+		warn("[CP/Summit] leaderstats missing for " .. plr.Name)
+		return
+	end
+
+	-- Optional sanity check (no creation, just warns if something is wrong)
+	local checkpoint = ls:FindFirstChild("Checkpoint")
+	local summit     = ls:FindFirstChild("Summit")
+	local coins      = ls:FindFirstChild("Coins")
+
+	if not (checkpoint and summit and coins) then
+		warn("[CP/Summit] Expected Checkpoint/Summit/Coins in leaderstats for " .. plr.Name)
+	end
+
+	-- Load DataStore data into the existing stats
+	loadCoins(plr)
+	loadCP(plr)
+	loadQuest(plr)
+
+	-- init CP FX list on client
+	local _, visited = getProgress(plr)
+	CheckpointFXEvent:FireClient(plr, "init", serializeVisited(visited))
+
+	plr.CharacterAdded:Connect(function(char)
+		task.wait(0.15)
+		if plr:GetAttribute("ForceDefaultSpawn") == true then return end
+		teleportPlayerToSavedSpot(plr, char)
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	lastSummitTimes[plr.UserId] = nil
+	saveCP(plr)
+	saveQuest(plr)
+	saveCoins(plr)
+end)
+
+game:BindToClose(function()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		saveCP(plr)
+		saveQuest(plr)
+		saveCoins(plr)
+	end
+end)

@@ -1,0 +1,276 @@
+-- StarterGui/HideUI/HideUIController.local.lua
+-- Hides every custom UI (keeps analog controls), hides PlayerList + Backpack.
+-- Show UI brings everything back to its previous state, PLUS forces on:
+--   - PlayerStatsGui
+--   - MenuUI.Main (and inner frames)
+--   - Custom Inventory (if present)
+-- Also fixes: UIs spawned by scripts WHILE hidden are now restored on Show.
+
+local Players    = game:GetService("Players")
+local StarterGui = game:GetService("StarterGui")
+
+local player     = Players.LocalPlayer
+local playerGui  = player:WaitForChild("PlayerGui")
+
+-- === Your HideUI pieces ===
+local hideGui     = script.Parent                                 -- ScreenGui: HideUI
+local panel       = hideGui:WaitForChild("Frame")                  -- main panel
+local hideAllBtn  = panel:WaitForChild("HideAllUI")                -- "UI" button
+local hideNameBtn = panel:WaitForChild("HideName")                 -- "NAME" button
+local showAllBtn  = hideGui:WaitForChild("ShowAllUI")              -- floating "SHOW UI" button
+
+-- Sibling ScreenGui (safe-guarded if missing)
+local customInvent = hideGui.Parent:FindFirstChild("Custom Inventory")
+
+-- === Keep analog / system bits alive (do NOT hide these ScreenGuis) ===
+local WHITELIST = {
+	["HideUI"]  = true,  -- this controller ScreenGui
+	["TouchGui"] = true, -- mobile joystick/jump
+}
+
+-- cache & state
+local hiddenGuis = {}
+local isHiddenAll = false  -- while true, any new ScreenGui added will be hidden+tracked
+
+---------------------------------------------------------------------
+-- Helpers to find specific ScreenGuis (case-insensitive + contains)
+---------------------------------------------------------------------
+local function findGuiExact(name)
+	local g = playerGui:FindFirstChild(name)
+	return (g and g:IsA("ScreenGui")) and g or nil
+end
+
+local function findGuiInsensitive(name)
+	local target = string.lower(name)
+	for _, c in ipairs(playerGui:GetChildren()) do
+		if c:IsA("ScreenGui") and string.lower(c.Name) == target then
+			return c
+		end
+	end
+	return nil
+end
+
+local function findGuiContains(substr)
+	local needle = string.lower(substr)
+	for _, c in ipairs(playerGui:GetChildren()) do
+		if c:IsA("ScreenGui") and string.find(string.lower(c.Name), needle, 1, true) then
+			return c
+		end
+	end
+	return nil
+end
+
+-- Make sure MenuUI.Main (and inner frames) are visible when MenuUI is enabled
+local function ensureMenuMainVisible()
+	local menu = findGuiExact("MenuUI") or findGuiInsensitive("MenuUI")
+	if not menu then return end
+	menu.Enabled = true
+	local main = menu:FindFirstChild("Main")
+	if main and main:IsA("Frame") then
+		main.Visible = true
+		-- Your inner structure: Main > MenuUI > ScrollingFrame
+		local innerMenu = main:FindFirstChild("MenuUI")
+		if innerMenu and innerMenu:IsA("Frame") then
+			innerMenu.Visible = true
+			local scroller = innerMenu:FindFirstChild("ScrollingFrame")
+			if scroller and scroller:IsA("ScrollingFrame") then
+				scroller.Visible = true
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- Name / nametag toggle (client-side)
+---------------------------------------------------------------------
+local NAME_TAG_HINTS = { "nametag", "name", "tag", "title", "overhead" }
+
+local function looksLikeNameTag(bb)
+	local n = string.lower(bb.Name)
+	for _, hint in ipairs(NAME_TAG_HINTS) do
+		if string.find(n, hint, 1, true) then return true end
+	end
+	return false
+end
+
+local function applyNameVisibilityToCharacter(char, hidden)
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.DisplayDistanceType = hidden and Enum.HumanoidDisplayDistanceType.None
+			or Enum.HumanoidDisplayDistanceType.Viewer
+	end
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BillboardGui") and looksLikeNameTag(d) then
+			d.Enabled = not hidden
+		end
+	end
+end
+
+local function applyNameVisibilityToAll(hidden)
+	for _, plr in ipairs(Players:GetPlayers()) do
+		applyNameVisibilityToCharacter(plr.Character, hidden)
+	end
+end
+
+local function bindPlayer(p)
+	p.CharacterAdded:Connect(function(char)
+		char:WaitForChild("Humanoid", 5)
+		local hidden = p:GetAttribute("ForceHidesName") == true
+		applyNameVisibilityToCharacter(char, hidden)
+	end)
+	if p.Character then
+		local hidden = p:GetAttribute("ForceHidesName") == true
+		applyNameVisibilityToCharacter(p.Character, hidden)
+	end
+end
+for _, p in ipairs(Players:GetPlayers()) do bindPlayer(p) end
+Players.PlayerAdded:Connect(bindPlayer)
+
+---------------------------------------------------------------------
+-- Mark/Hide helpers (handles GUIs spawned while hidden)
+---------------------------------------------------------------------
+local function shouldSkip(gui)
+	return not gui:IsA("ScreenGui") or WHITELIST[gui.Name]
+end
+
+local function markAndHide(gui)
+	if shouldSkip(gui) then return end
+	if gui:GetAttribute("WasHiddenByHideUI") ~= true then
+		gui:SetAttribute("WasHiddenByHideUI", true)
+		gui:SetAttribute("PrevEnabled", gui.Enabled)
+	end
+	hiddenGuis[gui] = gui:GetAttribute("PrevEnabled")
+	gui.Enabled = false
+end
+
+-- If new GUIs are added while we're hidden, hide & mark them too.
+playerGui.ChildAdded:Connect(function(gui)
+	task.defer(function()
+		if isHiddenAll then
+			markAndHide(gui)
+		end
+	end)
+end)
+
+---------------------------------------------------------------------
+-- Hide / Show logic
+---------------------------------------------------------------------
+local function hideAllCustom()
+	isHiddenAll = true
+	table.clear(hiddenGuis)
+	player:SetAttribute("ForceHideGui", true)
+
+	-- Disable every ScreenGui in PlayerGui except HideUI and whitelisted items
+	for _, gui in ipairs(playerGui:GetChildren()) do
+		markAndHide(gui)
+	end
+
+	-- Hide leaderboard (PlayerList) and hotbar (Backpack). Keep analog/touch intact.
+	pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList, false) end)
+	pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack,   false) end)
+	-- Optional: hide chat too
+	-- pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, false) end)
+
+	-- Show only the floating SHOW button
+	panel.Visible      = false
+	showAllBtn.Visible = true
+end
+
+local function showBaseSet()
+	isHiddenAll = false
+	player:SetAttribute("ForceHideGui", false)
+
+	-- Restore everything we hid (including stuff spawned while hidden)
+	for _, gui in ipairs(playerGui:GetChildren()) do
+		if gui:IsA("ScreenGui") and gui:GetAttribute("WasHiddenByHideUI") then
+			local prev = gui:GetAttribute("PrevEnabled")
+			gui.Enabled = (prev == nil) and true or prev
+			gui:SetAttribute("WasHiddenByHideUI", nil)
+			gui:SetAttribute("PrevEnabled", nil)
+		end
+	end
+	table.clear(hiddenGuis)
+
+	-- Force ON your key UIs
+	local stats = findGuiExact("PlayerStatsGui")
+		or findGuiInsensitive("PlayerStatsGui")
+		or findGuiContains("playerstats")
+	if stats then stats.Enabled = true end
+
+	ensureMenuMainVisible()
+
+	if customInvent and customInvent.Enabled == false then
+		customInvent.Enabled = true
+	end
+
+	task.wait(0.1)
+	-- Bring back leaderboard & hotbar
+	pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList, true) end)
+	-- pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack,   true) end)
+	-- Optional: re-enable chat if you hid it above
+	-- pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, true) end)
+
+	-- Restore the Hide panel
+	showAllBtn.Visible = false
+	panel.Visible      = true
+end
+
+---------------------------------------------------------------------
+-- Bind buttons
+---------------------------------------------------------------------
+local function bind(btn, fn)
+	if btn:IsA("GuiButton") then
+		btn.Activated:Connect(fn)
+	else
+		btn.Active = true
+		btn.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				fn()
+			end
+		end)
+	end
+end
+
+bind(hideAllBtn, hideAllCustom)
+bind(showAllBtn, showBaseSet)
+
+bind(hideNameBtn, function()
+	local currentHidden = player:GetAttribute("ForceHidesName") == true
+	local newHidden = not currentHidden
+	player:SetAttribute("ForceHidesName", newHidden)
+	applyNameVisibilityToAll(newHidden)
+	if hideNameBtn:IsA("TextButton") then
+		hideNameBtn.Text = newHidden and "SHOW NAME" or "HIDE NAME"
+	end
+end)
+
+-- Initial
+showAllBtn.Visible = false
+
+local attrValue = player:GetAttribute("ForceHideGui")
+local isHidden = false  -- Default to shown
+
+if attrValue ~= nil then
+	isHidden = (attrValue == true)
+else
+	-- Explicit: Handle missing (e.g., first join or cleared)
+	player:SetAttribute("ForceHideGui", false)
+end
+
+if isHidden then
+	hideAllCustom()
+	task.wait(0.1)
+	hideGui.Enabled = true
+	showAllBtn.Visible = true
+	panel.Visible = false
+else
+	showBaseSet()
+end
+
+local namesHidden = player:GetAttribute("ForceHidesName") == true
+applyNameVisibilityToAll(namesHidden)
+if hideNameBtn:IsA("TextButton") then
+	hideNameBtn.Text = namesHidden and "SHOW NAME" or "HIDE NAME"
+end
